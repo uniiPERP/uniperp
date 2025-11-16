@@ -30,6 +30,8 @@ import {MockVETH} from "./utils/mocks/MockVETH.sol";
 
 /// @title Complete Perpetual Trading Flow Test
 /// @notice Tests the full flow: pool initialization → swaps → position management → funding
+/// @dev REQUIRES MAINNET FORK: Run with --fork-url http://127.0.0.1:8545 (or your anvil fork URL)
+///      This test uses real Chainlink price feeds from mainnet
 contract FinalTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
     

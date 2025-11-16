@@ -92,6 +92,9 @@ contract PerpsHook is BaseHook {
     // Market configurations
     mapping(PoolId => MarketState) public markets;
     
+    // Store calculated trade sizes between beforeSwap and afterSwap
+    mapping(bytes32 => uint256) private tradeSizes;
+    
     // Risk parameters
     uint256 public constant MAX_LEVERAGE = 20e18;              // 20x leverage (18 decimals)
     uint256 public constant MIN_MARGIN = 10e6;                 // $10 minimum margin (6 decimals)
@@ -220,6 +223,11 @@ contract PerpsHook is BaseHook {
         // Perform validations and calculations
         _validateTrade(poolId, trade, params);
         
+        // For position operations, lock margin before swap (operations 0 and 1 are opening positions)
+        if (trade.operation <= 1 && trade.margin > 0) {
+            marginAccount.lockMargin(trade.trader, trade.margin);
+        }
+        
         // For position operations, we need to implement custom vAMM pricing curve
         if (trade.operation <= 3) { // Position operations
             return _executeVAMMPricing(poolId, key, params, trade, sender);
@@ -241,6 +249,16 @@ contract PerpsHook is BaseHook {
         
         // Decode trade parameters
         TradeParams memory trade = abi.decode(hookData, (TradeParams));
+        
+        // Retrieve calculated trade size from beforeSwap (if position operation)
+        if (trade.operation <= 3) {
+            bytes32 swapKey = keccak256(abi.encodePacked(poolId, trade.trader, trade.operation, trade.tokenId, block.number));
+            uint256 calculatedSize = tradeSizes[swapKey];
+            if (calculatedSize > 0) {
+                trade.size = calculatedSize;
+                delete tradeSizes[swapKey]; // Clean up
+            }
+        }
         
         // Execute perp-specific logic based on operation type
         if (trade.operation == 0 || trade.operation == 1) { // Open long/short
@@ -304,62 +322,124 @@ contract PerpsHook is BaseHook {
         uint24 dynamicFee = uint24(uint256(feeSum));
         
         // Execute the custom vAMM swap with proper currency settlement
-        BeforeSwapDelta delta = _executeVAMMSwap(key, params, markPrice, sender);
+        BeforeSwapDelta delta = _executeVAMMSwap(poolId, key, params, trade);
         
         return (BaseHook.beforeSwap.selector, delta, dynamicFee);
     }
 
-    /// @notice Execute vAMM swap with proper currency settlement
-    /// @param key Pool key
+    /// @notice Execute vAMM swap using constant product formula
+    /// @param poolId Pool identifier
     /// @param params Swap parameters  
-    /// @param markPrice Current mark price
-    /// @param sender Address of the swap sender (user)
+    /// @param trade Trade parameters (contains operation type)
     /// @return BeforeSwapDelta for the executed swap
-    function _executeVAMMSwap(PoolKey calldata key, SwapParams calldata params, uint256 markPrice, address sender)
+    function _executeVAMMSwap(PoolId poolId, PoolKey calldata /* key */, SwapParams calldata params, TradeParams memory trade)
         internal
         returns (BeforeSwapDelta)
     {
+        MarketState storage market = markets[poolId];
         bool exactInput = params.amountSpecified < 0;
-        bool zeroForOne = params.zeroForOne;
+        bool isLong = (trade.operation == 0 || trade.operation == 2);
+        bool isClose = (trade.operation == 2 || trade.operation == 3);
         
-        // Determine input and output currencies
-        (Currency inputCurrency, Currency outputCurrency) = zeroForOne 
-            ? (key.currency0, key.currency1)
-            : (key.currency1, key.currency0);
-            
+        uint256 inputAmount;
+        uint256 outputAmount;
+        uint256 calculatedSize;
+        
         if (exactInput) {
-            uint256 inputAmount = uint256(-params.amountSpecified);
-            uint256 outputAmount;
+            inputAmount = uint256(-params.amountSpecified);
             
-            if (zeroForOne) {
-                // Selling currency0 (ETH) for currency1 (USDC)
-                outputAmount = (inputAmount * markPrice) / 1e30;
-            } else {
-                // Buying currency0 (ETH) with currency1 (USDC)
-                outputAmount = (inputAmount * 1e30) / markPrice;
+            if (isLong && !isClose) {
+                // Opening Long: User adds USDC (quote), gets ETH (base)
+                // Update virtual reserves using constant product: K = base * quote
+                uint256 oldBase = market.virtualBase;
+                market.virtualQuote += inputAmount; // Add USDC to quote reserve
+                market.virtualBase = market.k / market.virtualQuote; // Calculate new base
+                outputAmount = oldBase - market.virtualBase; // ETH "bought"
+                calculatedSize = outputAmount; // Position size in ETH
+                
+            } else if (!isLong && !isClose) {
+                // Opening Short: User adds ETH (base), gets USDC (quote)
+                uint256 oldQuote = market.virtualQuote;
+                market.virtualBase += inputAmount; // Add ETH to base reserve
+                market.virtualQuote = market.k / market.virtualBase; // Calculate new quote
+                outputAmount = oldQuote - market.virtualQuote; // USDC "bought"
+                calculatedSize = inputAmount; // Position size in ETH
+                
+            } else if (isClose && isLong) {
+                // Closing Long: User adds ETH (base), gets USDC (quote)
+                // Reverse of opening long
+                uint256 oldQuote = market.virtualQuote;
+                market.virtualBase += inputAmount; // Add ETH back to base
+                market.virtualQuote = market.k / market.virtualBase;
+                outputAmount = market.virtualQuote - oldQuote; // USDC "received"
+                calculatedSize = inputAmount;
+                
+            } else { // isClose && !isLong
+                // Closing Short: User adds USDC (quote), gets ETH (base)
+                // Reverse of opening short
+                uint256 oldBase = market.virtualBase;
+                market.virtualQuote += inputAmount; // Add USDC back to quote
+                market.virtualBase = market.k / market.virtualQuote;
+                outputAmount = market.virtualBase - oldBase; // ETH "received"
+                calculatedSize = outputAmount;
             }
             
-            // Return delta - PoolManager will handle token transfers
-            // The user will settle by transferring tokens to PoolManager
-            // We'll handle position logic in afterSwap after tokens are settled
-            return toBeforeSwapDelta(int128(-params.amountSpecified), int128(int256(outputAmount)));
         } else {
-            uint256 outputAmount = uint256(params.amountSpecified);
-            uint256 inputAmount;
+            // Exact output - calculate input needed
+            outputAmount = uint256(params.amountSpecified);
             
-            if (zeroForOne) {
-                // User wants specific USDC, calculate ETH input
-                inputAmount = (outputAmount * 1e30) / markPrice;
-            } else {
-                // User wants specific ETH, calculate USDC input
-                inputAmount = (outputAmount * markPrice) / 1e30;
+            if (isLong && !isClose) {
+                // Opening Long: User wants specific ETH, calculate USDC needed
+                uint256 oldBase = market.virtualBase;
+                uint256 newBase = oldBase - outputAmount; // Remove ETH from base
+                uint256 newQuote = market.k / newBase;
+                inputAmount = newQuote - market.virtualQuote; // USDC needed
+                market.virtualQuote = newQuote;
+                market.virtualBase = newBase;
+                calculatedSize = outputAmount;
+                
+            } else if (!isLong && !isClose) {
+                // Opening Short: User wants specific USDC, calculate ETH needed
+                uint256 oldQuote = market.virtualQuote;
+                uint256 newQuote = oldQuote - outputAmount; // Remove USDC from quote
+                uint256 newBase = market.k / newQuote;
+                inputAmount = newBase - market.virtualBase; // ETH needed
+                market.virtualBase = newBase;
+                market.virtualQuote = newQuote;
+                calculatedSize = inputAmount;
+                
+            } else if (isClose && isLong) {
+                // Closing Long: User wants specific USDC, calculate ETH needed
+                uint256 oldQuote = market.virtualQuote;
+                uint256 newQuote = oldQuote + outputAmount; // Add USDC to quote
+                uint256 newBase = market.k / newQuote;
+                inputAmount = market.virtualBase - newBase; // ETH needed
+                market.virtualBase = newBase;
+                market.virtualQuote = newQuote;
+                calculatedSize = inputAmount;
+                
+            } else { // isClose && !isLong
+                // Closing Short: User wants specific ETH, calculate USDC needed
+                uint256 oldBase = market.virtualBase;
+                uint256 newBase = oldBase + outputAmount; // Add ETH to base
+                uint256 newQuote = market.k / newBase;
+                inputAmount = newQuote - market.virtualQuote; // USDC needed
+                market.virtualBase = newBase;
+                market.virtualQuote = newQuote;
+                calculatedSize = outputAmount;
             }
-            
-            // Return delta - PoolManager will handle token transfers
-            // The user will settle by transferring tokens to PoolManager
-            // We'll handle position logic in afterSwap after tokens are settled
-            return toBeforeSwapDelta(-int128(int256(inputAmount)), int128(params.amountSpecified));
         }
+        
+        // Store calculated trade size for afterSwap (using trader address and operation as key)
+        // This allows afterSwap to retrieve the calculated size
+        bytes32 swapKey = keccak256(abi.encodePacked(poolId, trade.trader, trade.operation, trade.tokenId, block.number));
+        tradeSizes[swapKey] = calculatedSize;
+        
+        // Emit reserve update event
+        emit VirtualReservesUpdated(poolId, market.virtualBase, market.virtualQuote);
+        
+        // Return delta - PoolManager will handle token transfers
+        return toBeforeSwapDelta(-int128(int256(inputAmount)), int128(int256(outputAmount)));
     }
 
     /// @notice Settle a currency to the PoolManager
@@ -428,19 +508,15 @@ contract PerpsHook is BaseHook {
     function _executeOpenPosition(PoolId poolId, TradeParams memory trade, SwapParams calldata /* params */) internal {
         MarketState storage market = markets[poolId];
         
-        // Calculate entry price and update virtual reserves
+        // Calculate entry price (virtual reserves already updated in beforeSwap)
         uint256 entryPrice = _getMarkPrice(poolId);
         bool isLong = (trade.operation == 0);
         
-        // Update virtual reserves
+        // Update open interest (virtual reserves already updated in _executeVAMMSwap)
         if (isLong) {
             uint256 quoteIn = (trade.size * entryPrice) / 1e18;
-            market.virtualQuote += quoteIn;
-            market.virtualBase = market.k / market.virtualQuote;
             market.totalLongOI += quoteIn / 1e12;  // Convert to 6 decimals
         } else {
-            market.virtualBase += trade.size;
-            market.virtualQuote = market.k / market.virtualBase;
             uint256 shortNotional = (trade.size * entryPrice) / 1e18;
             market.totalShortOI += shortNotional / 1e12;  // Convert to 6 decimals
         }
@@ -495,8 +571,6 @@ contract PerpsHook is BaseHook {
             emit PositionOpened(poolId, trade.trader, trade.tokenId, 
                 newSizeBase, newMargin);
         }
-        
-        emit VirtualReservesUpdated(poolId, market.virtualBase, market.virtualQuote);
     }
 
     function _executeClosePosition(PoolId poolId, TradeParams memory trade, SwapParams calldata /* params */) internal {
@@ -505,20 +579,16 @@ contract PerpsHook is BaseHook {
         // Get position details
         PositionLib.Position memory position = positionManager.getPosition(trade.tokenId);
         
-        // Calculate exit price and PnL
+        // Calculate exit price and PnL (virtual reserves already updated in _executeVAMMSwap)
         uint256 exitPrice = _getMarkPrice(poolId);
         bool wasLong = position.sizeBase > 0;
         uint256 positionSize = uint256(wasLong ? position.sizeBase : -position.sizeBase);
         
-        // Update virtual reserves (opposite of opening)
+        // Update open interest (virtual reserves already updated in _executeVAMMSwap)
         if (wasLong) {
             uint256 quoteOut = (positionSize * exitPrice) / 1e18;
-            market.virtualQuote -= quoteOut;
-            market.virtualBase = market.k / market.virtualQuote;
             market.totalLongOI -= quoteOut / 1e12;  // Convert to 6 decimals
         } else {
-            market.virtualBase -= positionSize;
-            market.virtualQuote = market.k / market.virtualBase;
             uint256 shortNotional = (positionSize * exitPrice) / 1e18;
             market.totalShortOI -= shortNotional / 1e12;  // Convert to 6 decimals
         }
@@ -527,7 +597,6 @@ contract PerpsHook is BaseHook {
         positionManager.closePosition(trade.tokenId, exitPrice);
         
         emit PositionClosed(poolId, trade.trader, trade.tokenId, 0); // PnL calculated in PositionManager
-        emit VirtualReservesUpdated(poolId, market.virtualBase, market.virtualQuote);
     }
 
     function _executeAddMargin(TradeParams memory trade) internal {
