@@ -6,7 +6,7 @@ import {PositionLib} from "../src/libraries/PositionLib.sol";
 import {PositionFactory} from "../src/PositionFactory.sol";
 import {PositionNFT} from "../src/PositionNFT.sol";
 import {MarketManager} from "../src/MarketManager.sol";
-import {PositionManager} from "../src/PositionManagerV2.sol";
+import {PositionManager} from "../src/PositionManager.sol";
 import {MarginAccount} from "../src/MarginAccount.sol";
 import {MockUSDC} from "../test/utils/mocks/MockUSDC.sol";
 

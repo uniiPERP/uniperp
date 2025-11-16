@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {console} from "forge-std/console.sol";
 
-import {PositionManager} from "../src/PositionManagerV2.sol";
+import {PositionManager} from "../src/PositionManager.sol";
 import {PositionFactory} from "../src/PositionFactory.sol";
 import {PositionNFT} from "../src/PositionNFT.sol";
 import {MarketManager} from "../src/MarketManager.sol";

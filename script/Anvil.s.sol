@@ -15,7 +15,7 @@ import {MockUSDC} from "../test/utils/mocks/MockUSDC.sol";
 import {MockVETH} from "../test/utils/mocks/MockVETH.sol";
 
 import {PerpsHook} from "../src/PerpsHook.sol";
-import {PositionManager} from "../src/PositionManagerV2.sol";
+import {PositionManager} from "../src/PositionManager.sol";
 import {PositionFactory} from "../src/PositionFactory.sol";
 import {PositionNFT} from "../src/PositionNFT.sol";
 import {MarketManager} from "../src/MarketManager.sol";

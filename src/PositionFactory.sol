@@ -37,6 +37,7 @@ contract PositionFactory is Ownable, ReentrancyGuard {
     mapping(address => uint256[]) public userPositions;
     mapping(bytes32 => uint256[]) public marketPositions;
     mapping(address => bool) public keyManagers;
+    mapping(address => bool) public authorizedContracts; // Authorized contracts (PerpsHook, PerpsRouter)
 
     // Events
     event PositionOpened(uint256 indexed tokenId, address indexed owner, bytes32 indexed marketId, int256 sizeBase, uint256 entryPrice, uint256 margin);
@@ -47,9 +48,16 @@ contract PositionFactory is Ownable, ReentrancyGuard {
     event MarketAdded(bytes32 indexed marketId, address baseAsset, address quoteAsset, address poolAddress);
     event KeyManagerAdded(address indexed keyManager);
     event KeyManagerRemoved(address indexed keyManager);
+    event AuthorizedContractAdded(address indexed contractAddress);
+    event AuthorizedContractRemoved(address indexed contractAddress);
 
     modifier onlyOwnerOrKeyManager() {
         require(msg.sender == owner() || keyManagers[msg.sender], "Not authorized");
+        _;
+    }
+
+    modifier onlyAuthorized() {
+        require(authorizedContracts[msg.sender], "Not authorized contract");
         _;
     }
 
@@ -71,6 +79,17 @@ contract PositionFactory is Ownable, ReentrancyGuard {
     function removeKeyManager(address keyManager) external onlyOwner {
         keyManagers[keyManager] = false;
         emit KeyManagerRemoved(keyManager);
+    }
+
+    function addAuthorizedContract(address contractAddress) external onlyOwner {
+        require(contractAddress != address(0), "Invalid address");
+        authorizedContracts[contractAddress] = true;
+        emit AuthorizedContractAdded(contractAddress);
+    }
+
+    function removeAuthorizedContract(address contractAddress) external onlyOwner {
+        authorizedContracts[contractAddress] = false;
+        emit AuthorizedContractRemoved(contractAddress);
     }
 
     /// @notice Add a new trading market
@@ -170,13 +189,15 @@ contract PositionFactory is Ownable, ReentrancyGuard {
         emit PositionClosed(tokenId, msg.sender, pnl);
     }
 
-    /// @notice Update position (for authorized contracts like PerpsRouter)
-    function updatePosition(uint256 tokenId, int256 newSizeBase, uint256 newMargin) external returns (bool) {
+    /// @notice Update position (for authorized contracts like PerpsHook, PerpsRouter)
+    /// @dev Only authorized contracts can call this to ensure vAMM state synchronization
+    function updatePosition(uint256 tokenId, int256 newSizeBase, uint256 newMargin) external onlyAuthorized returns (bool) {
         return updatePosition(msg.sender, tokenId, newSizeBase, newMargin);
     }
 
     /// @notice Update position with explicit user parameter (for modular calls)
-    function updatePosition(address user, uint256 tokenId, int256 newSizeBase, uint256 newMargin) public returns (bool) {
+    /// @dev Only authorized contracts can call this to ensure vAMM state synchronization
+    function updatePosition(address user, uint256 tokenId, int256 newSizeBase, uint256 newMargin) public onlyAuthorized returns (bool) {
         PositionLib.Position storage position = positions[tokenId];
         position.requirePositionOwner(user);
         
