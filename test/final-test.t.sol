@@ -186,6 +186,9 @@ contract FinalTest is Test, Deployers {
         // This requires running with --fork-url to mainnet
         address chainlinkETHUSD = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
         fundingOracle.addMarket(poolId, address(perpsHook), chainlinkETHUSD);
+        // Add Chainlink feed as a price source (required for getSpotPrice to work)
+        // Use large maxAge (24 hours) to handle time warping in tests
+        fundingOracle.addChainlinkPriceSource(poolId, chainlinkETHUSD, 1e18, 86400); // weight=1e18, maxAge=24 hours
         console.log("Registered market in FundingOracle with Chainlink feed:", chainlinkETHUSD);
         
         // Initialize the pool (this will trigger afterInitialize hook)
@@ -326,11 +329,13 @@ contract FinalTest is Test, Deployers {
         console.log("STEP 2: Alice Opens 2x Leveraged Long Position");
         console.log("================================================");
         
-        uint256 aliceMargin = 5000e6;  // $5,000
+        uint256 aliceMargin = 5000e6;  // $5,000 (6 decimals)
         uint256 aliceLeverage = 2;     // 2x leverage
-        uint256 alicePositionValue = aliceMargin * aliceLeverage; // $10,000
-        uint256 markPrice = perpsHook.getMarkPrice(poolId);
-        uint256 aliceEthSize = (alicePositionValue * 1e18) / markPrice; // ETH amount
+        uint256 alicePositionValue = aliceMargin * aliceLeverage; // $10,000 (6 decimals)
+        uint256 markPrice = perpsHook.getMarkPrice(poolId); // Price in 18 decimals
+        // Convert position value from 6 decimals to 18 decimals, then divide by price to get ETH size in 18 decimals
+        uint256 alicePositionValue18 = alicePositionValue * 1e12; // Convert to 18 decimals
+        uint256 aliceEthSize = (alicePositionValue18) / markPrice; // ETH amount in 18 decimals
         
         console.log("Alice's Trade Plan:");
         console.log("  Margin: $", aliceMargin / 1e6);
@@ -371,11 +376,13 @@ contract FinalTest is Test, Deployers {
         console.log("STEP 3: Bob Opens 3x Leveraged Short Position");
         console.log("==============================================");
         
-        uint256 bobMargin = 4000e6;  // $4,000
+        uint256 bobMargin = 4000e6;  // $4,000 (6 decimals)
         uint256 bobLeverage = 3;     // 3x leverage
-        uint256 bobPositionValue = bobMargin * bobLeverage; // $12,000
-        markPrice = perpsHook.getMarkPrice(poolId); // Get updated price
-        uint256 bobEthSize = (bobPositionValue * 1e18) / markPrice; // ETH amount
+        uint256 bobPositionValue = bobMargin * bobLeverage; // $12,000 (6 decimals)
+        markPrice = perpsHook.getMarkPrice(poolId); // Get updated price (18 decimals)
+        // Convert position value from 6 decimals to 18 decimals, then divide by price to get ETH size in 18 decimals
+        uint256 bobPositionValue18 = bobPositionValue * 1e12; // Convert to 18 decimals
+        uint256 bobEthSize = (bobPositionValue18) / markPrice; // ETH amount in 18 decimals
         
         console.log("Bob's Trade Plan:");
         console.log("  Margin: $", bobMargin / 1e6);
@@ -400,8 +407,8 @@ contract FinalTest is Test, Deployers {
         bool bobZeroForOne = Currency.unwrap(currency0) == address(veth);
         // Use negative value for exact input (amountSpecified < 0 means exact input)
         // For short, we're selling vETH, so we need to specify vETH amount
-        // But the hook handles this via TradeParams.size, so we use a small trigger amount
-        int256 bobAmountSpecified = -int256(bobEthSize / 100); // Negative = exact input of vETH
+        // The hook will cancel this to 0, but we need a non-zero initial amount
+        int256 bobAmountSpecified = -int256(bobEthSize); // Negative = exact input of vETH
         
         console.log("Executing Bob's swap...");
         _executeSwap(bob, bobTrade, bobZeroForOne, bobAmountSpecified);
@@ -496,9 +503,11 @@ contract FinalTest is Test, Deployers {
     function test_OpenLongPosition() public {
         console.log("=== TESTING OPEN LONG POSITION ===");
         
-        uint256 margin = 1000e6; // $1,000
-        uint256 markPrice = perpsHook.getMarkPrice(poolId);
-        uint256 ethSize = (margin * 2 * 1e18) / markPrice; // 2x leverage
+        uint256 margin = 1000e6; // $1,000 (6 decimals)
+        uint256 markPrice = perpsHook.getMarkPrice(poolId); // Price in 18 decimals
+        uint256 positionValue = margin * 2; // 2x leverage (6 decimals)
+        uint256 positionValue18 = positionValue * 1e12; // Convert to 18 decimals
+        uint256 ethSize = positionValue18 / markPrice; // ETH amount in 18 decimals
         
         PerpsHook.TradeParams memory trade = PerpsHook.TradeParams({
             operation: 0, // open_long
@@ -517,15 +526,22 @@ contract FinalTest is Test, Deployers {
         assertGt(market.totalLongOI, 0, "Long OI should increase");
         
         console.log("Long position opened successfully");
-        console.log("Total Long OI:", market.totalLongOI / 1e18);
+        console.log("Total Long OI:", market.totalLongOI / 1e6, "USDC (6 decimals)");
     }
     
     function test_OpenShortPosition() public {
         console.log("=== TESTING OPEN SHORT POSITION ===");
         
-        uint256 margin = 1000e6; // $1,000
-        uint256 markPrice = perpsHook.getMarkPrice(poolId);
-        uint256 ethSize = (margin * 2 * 1e18) / markPrice; // 2x leverage
+        uint256 margin = 1000e6; // $1,000 (6 decimals)
+        uint256 markPrice = perpsHook.getMarkPrice(poolId); // Price in 18 decimals
+        uint256 positionValue = margin * 2; // 2x leverage (6 decimals)
+        uint256 positionValue18 = positionValue * 1e12; // Convert to 18 decimals
+        uint256 ethSize = positionValue18 / markPrice; // ETH amount in 18 decimals
+        
+        // For testing: use a meaningful ethSize to ensure OI calculation works
+        // The hook will cancel the swap to 0 anyway, but we need non-zero initial amount
+        // Use at least 0.1 ETH (1e17) to ensure OI calculation doesn't round to 0
+        if (ethSize < 1e17) ethSize = 1e17; // Minimum 0.1 ETH for meaningful OI
         
         PerpsHook.TradeParams memory trade = PerpsHook.TradeParams({
             operation: 1, // open_short
@@ -536,15 +552,21 @@ contract FinalTest is Test, Deployers {
             trader: bob
         });
         
+        // Short = sell base (vETH) = sell vETH for USDC
+        // If currency0 = vETH, currency1 = USDC: short = sell vETH (currency0) for USDC (currency1) = zeroForOne = true
+        // If currency0 = USDC, currency1 = vETH: short = sell vETH (currency1) for USDC (currency0) = zeroForOne = false
         bool zeroForOne = Currency.unwrap(currency0) == address(veth);
-        _executeSwap(bob, trade, zeroForOne, -int256(ethSize / 100)); // Negative = exact input of vETH
+        // Use negative value for exact input (amountSpecified < 0 means exact input)
+        // For short, we're selling vETH, so we need to specify vETH amount
+        // The hook will cancel this to 0, but we need a non-zero initial amount
+        _executeSwap(bob, trade, zeroForOne, -int256(ethSize)); // Negative = exact input of vETH
         
         // Verify position was created
         PerpsHook.MarketState memory market = perpsHook.getMarketState(poolId);
         assertGt(market.totalShortOI, 0, "Short OI should increase");
         
         console.log("Short position opened successfully");
-        console.log("Total Short OI:", market.totalShortOI / 1e18);
+        console.log("Total Short OI:", market.totalShortOI / 1e6, "USDC (6 decimals)");
     }
     
     function test_FundingMechanism() public {
