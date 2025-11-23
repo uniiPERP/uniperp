@@ -8,7 +8,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 
 import {PositionLib} from "./libraries/PositionLib.sol";
-import {PositionManager} from "./PositionManagerV2.sol";
+import {PositionManager} from "./PositionManager.sol";
 import {PositionFactory} from "./PositionFactory.sol";
 import {MarginAccount} from "./MarginAccount.sol";
 import {FundingOracle} from "./FundingOracle.sol";

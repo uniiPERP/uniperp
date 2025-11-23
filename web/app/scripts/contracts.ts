@@ -34,7 +34,7 @@ const mockVETHArtifact = { abi: loadABI("MockVETH") };
 const insuranceFundArtifact = { abi: loadABI("InsuranceFund") };
 const liquidationEngineArtifact = { abi: loadABI("LiquidationEngine") };
 const positionFactoryArtifact = { abi: loadABI("PositionFactory") };
-const marketManagerArtifact = { abi: loadABI("MarketManagerV2") };
+const marketManagerArtifact = { abi: loadABI("MarketManager") };
 
 // For contracts that don't have ABI files yet, we'll use minimal ABIs
 const iPoolManagerArtifact = { abi: [] };

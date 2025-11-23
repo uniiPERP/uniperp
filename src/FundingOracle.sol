@@ -3,8 +3,33 @@ pragma solidity ^0.8.26;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
-import "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
-import "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
+
+/// @notice Chainlink AggregatorV3Interface for price feeds
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function description() external view returns (string memory);
+    function version() external view returns (uint256);
+    function getRoundData(uint80 _roundId)
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+    function latestRoundData()
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+}
 
 /// @notice Interface for price oracles
 interface IPriceOracle {
@@ -13,12 +38,6 @@ interface IPriceOracle {
         external
         view
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
-}
-
-/// @notice Interface for Pyth price updates
-interface IPythPriceUpdate {
-    function updatePythPrices(bytes[] calldata priceUpdateData) external payable;
-    function getPythUpdateFee(bytes[] calldata priceUpdateData) external view returns (uint256);
 }
 
 /// @notice Interface for vAMM hooks to get mark price
@@ -41,9 +60,9 @@ interface IVAMMHook {
         );
 }
 
-/// @title FundingOracle - Price Aggregation and Funding Rate Oracle
+/// @title FundingOracle - Price Aggregation and Funding Rate Oracle using Chainlink
 /// @notice Provides robust price data and funding rate calculations for perpetual futures
-/// @dev Uses multiple price sources and median calculation for manipulation resistance
+/// @dev Uses Chainlink price feeds and median calculation for manipulation resistance
 contract FundingOracle is Ownable {
     using PoolIdLibrary for PoolId;
 
@@ -65,12 +84,11 @@ contract FundingOracle is Ownable {
 
     /// @notice Price source configuration
     struct PriceSource {
-        address oracle; // Oracle contract address
+        address oracle; // Oracle contract address (Chainlink aggregator or other)
         uint256 weight; // Weight in median calculation
         uint256 maxAge; // Maximum age for price data (seconds)
         bool isActive; // Source is active
-        bytes32 pythPriceFeedId; // Pyth price feed ID (if using Pyth)
-        bool isPythSource; // Whether this is a Pyth price source
+        bool isChainlinkSource; // Whether this is a Chainlink price feed
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -86,14 +104,11 @@ contract FundingOracle is Ownable {
     /// @notice vAMM hook addresses for mark price calculation
     mapping(PoolId => address) public vammHooks;
 
-    /// @notice Pyth contract instance
-    IPyth public immutable pyth;
+    /// @notice Chainlink price feed aggregators for each market
+    mapping(PoolId => address) public chainlinkPriceFeeds;
 
-    /// @notice Price feed IDs for each market (for Pyth integration)
-    mapping(PoolId => bytes32) public pythPriceFeedIds;
-
-    /// @notice Maximum price staleness for Pyth feeds (seconds)
-    uint256 public pythMaxStaleness = 60;
+    /// @notice Maximum price staleness for Chainlink feeds (seconds)
+    uint256 public chainlinkMaxStaleness = 3600; // 1 hour default
 
     /// @notice Default funding parameters
     uint256 public constant DEFAULT_FUNDING_INTERVAL = 1 hours;
@@ -112,8 +127,8 @@ contract FundingOracle is Ownable {
     event FundingUpdated(PoolId indexed poolId, int256 newFundingIndex, int256 fundingRate, uint256 timestamp);
     event PriceSourceAdded(PoolId indexed poolId, address oracle, uint256 weight);
     event PriceSourceUpdated(PoolId indexed poolId, address oracle, uint256 weight, bool isActive);
-    event PythPriceFeedAdded(PoolId indexed poolId, bytes32 priceFeedId);
-    event PythPricesUpdated(PoolId indexed poolId, uint256 price, uint256 timestamp);
+    event ChainlinkPriceFeedAdded(PoolId indexed poolId, address priceFeed);
+    event ChainlinkPriceUpdated(PoolId indexed poolId, uint256 price, uint256 timestamp);
     event MarkPriceUpdated(PoolId indexed poolId, uint256 markPrice, uint256 spotPrice, int256 premium);
     event MarketStatusChanged(PoolId indexed poolId, bool isActive);
 
@@ -127,18 +142,16 @@ contract FundingOracle is Ownable {
     error StalePrice();
     error InsufficientPriceSources();
     error InvalidFundingParameters();
-    error PythUpdateRequired();
-    error InsufficientPythFee();
+    error InvalidChainlinkFeed();
+    error PriceOutOfBounds();
 
     /*//////////////////////////////////////////////////////////////
                              CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Constructor
-    /// @param pythContract Address of the Pyth contract
-    constructor(address pythContract) Ownable(msg.sender) {
-        require(pythContract != address(0), "Invalid Pyth contract");
-        pyth = IPyth(pythContract);
+    constructor() Ownable(msg.sender) {
+        // No Chainlink contract needed - we use individual aggregator addresses
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -148,15 +161,26 @@ contract FundingOracle is Ownable {
     /// @notice Add a new market for funding calculations
     /// @param poolId Pool identifier
     /// @param vammHook Address of the vAMM hook contract
-    /// @param pythPriceFeedId Pyth price feed ID for this market (optional, use 0x0 if not using Pyth)
-    function addMarket(PoolId poolId, address vammHook, bytes32 pythPriceFeedId) external onlyOwner {
+    /// @param chainlinkPriceFeed Address of Chainlink price feed aggregator (optional, use address(0) if not using Chainlink)
+    function addMarket(PoolId poolId, address vammHook, address chainlinkPriceFeed) external onlyOwner {
         require(vammHook != address(0), "Invalid vAMM hook");
 
         vammHooks[poolId] = vammHook;
         
-        if (pythPriceFeedId != bytes32(0)) {
-            pythPriceFeedIds[poolId] = pythPriceFeedId;
-            emit PythPriceFeedAdded(poolId, pythPriceFeedId);
+        if (chainlinkPriceFeed != address(0)) {
+            // Validate Chainlink feed
+            try AggregatorV3Interface(chainlinkPriceFeed).latestRoundData() returns (
+                uint80,
+                int256,
+                uint256,
+                uint256,
+                uint80
+            ) {
+                chainlinkPriceFeeds[poolId] = chainlinkPriceFeed;
+                emit ChainlinkPriceFeedAdded(poolId, chainlinkPriceFeed);
+            } catch {
+                revert InvalidChainlinkFeed();
+            }
         }
 
         markets[poolId] = MarketData({
@@ -188,99 +212,47 @@ contract FundingOracle is Ownable {
             weight: weight, 
             maxAge: maxAge, 
             isActive: true,
-            pythPriceFeedId: bytes32(0),
-            isPythSource: false
+            isChainlinkSource: false
         }));
 
         emit PriceSourceAdded(poolId, oracle, weight);
     }
 
-    /// @notice Add Pyth price source for a market
+    /// @notice Add Chainlink price source for a market
     /// @param poolId Pool identifier
-    /// @param pythPriceFeedId Pyth price feed ID
+    /// @param chainlinkPriceFeed Address of Chainlink price feed aggregator
     /// @param weight Weight in median calculation
     /// @param maxAge Maximum age for price data
-    function addPythPriceSource(PoolId poolId, bytes32 pythPriceFeedId, uint256 weight, uint256 maxAge) external onlyOwner {
+    function addChainlinkPriceSource(
+        PoolId poolId, 
+        address chainlinkPriceFeed, 
+        uint256 weight, 
+        uint256 maxAge
+    ) external onlyOwner {
         if (markets[poolId].lastFundingUpdate == 0) revert MarketNotFound();
-        require(pythPriceFeedId != bytes32(0), "Invalid price feed ID");
+        require(chainlinkPriceFeed != address(0), "Invalid price feed");
         require(weight > 0, "Invalid weight");
 
-        priceSources[poolId].push(PriceSource({
-            oracle: address(pyth), 
-            weight: weight, 
-            maxAge: maxAge, 
-            isActive: true,
-            pythPriceFeedId: pythPriceFeedId,
-            isPythSource: true
-        }));
+        // Validate Chainlink feed
+        try AggregatorV3Interface(chainlinkPriceFeed).latestRoundData() returns (
+            uint80,
+            int256,
+            uint256,
+            uint256,
+            uint80
+        ) {
+            priceSources[poolId].push(PriceSource({
+                oracle: chainlinkPriceFeed, 
+                weight: weight, 
+                maxAge: maxAge, 
+                isActive: true,
+                isChainlinkSource: true
+            }));
 
-        emit PriceSourceAdded(poolId, address(pyth), weight);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                         PYTH PRICE UPDATES
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Update Pyth prices with price update data
-    /// @param priceUpdateData Array of price update data from Pyth
-    function updatePythPrices(bytes[] calldata priceUpdateData) external payable {
-        uint256 fee = pyth.getUpdateFee(priceUpdateData);
-        if (msg.value < fee) revert InsufficientPythFee();
-        
-        pyth.updatePriceFeeds{value: fee}(priceUpdateData);
-        
-        // Refund excess payment
-        if (msg.value > fee) {
-            payable(msg.sender).transfer(msg.value - fee);
+            emit PriceSourceAdded(poolId, chainlinkPriceFeed, weight);
+        } catch {
+            revert InvalidChainlinkFeed();
         }
-    }
-
-    /// @notice Get the fee required to update Pyth prices
-    /// @param priceUpdateData Array of price update data
-    /// @return fee Required fee in wei
-    function getPythUpdateFee(bytes[] calldata priceUpdateData) external view returns (uint256 fee) {
-        return pyth.getUpdateFee(priceUpdateData);
-    }
-
-    /// @notice Update funding with Pyth price updates
-    /// @param poolId Pool identifier
-    /// @param priceUpdateData Array of price update data from Pyth (optional, can be empty)
-    function updateFundingWithPyth(PoolId poolId, bytes[] calldata priceUpdateData) external payable {
-        MarketData storage market = markets[poolId];
-        if (!market.isActive) revert MarketNotActive();
-
-        // Update Pyth prices if provided
-        if (priceUpdateData.length > 0) {
-            uint256 fee = pyth.getUpdateFee(priceUpdateData);
-            if (msg.value < fee) revert InsufficientPythFee();
-            
-            pyth.updatePriceFeeds{value: fee}(priceUpdateData);
-            
-            // Refund excess payment
-            if (msg.value > fee) {
-                payable(msg.sender).transfer(msg.value - fee);
-            }
-        }
-
-        // Check if enough time has passed
-        if (block.timestamp < market.lastFundingUpdate + market.fundingInterval) {
-            return; // Too early to update
-        }
-
-        // Get current prices
-        uint256 markPrice = getMarkPrice(poolId);
-        uint256 spotPrice = getSpotPrice(poolId);
-
-        // Calculate funding rate
-        int256 fundingRate = _calculateFundingRate(poolId, markPrice, spotPrice);
-
-        // Update global funding index
-        market.globalFundingIndex += fundingRate;
-        market.lastFundingUpdate = block.timestamp;
-        market.markPrice = markPrice;
-        market.spotPrice = spotPrice;
-
-        emit FundingUpdated(poolId, market.globalFundingIndex, fundingRate, block.timestamp);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -367,17 +339,15 @@ contract FundingOracle is Ownable {
             PriceSource storage source = priceSources[poolId][i];
             if (!source.isActive) continue;
 
-            if (source.isPythSource) {
-                // Handle Pyth price source
-                try pyth.getPriceNoOlderThan(source.pythPriceFeedId, source.maxAge) returns (PythStructs.Price memory pythPrice) {
-                    if (pythPrice.price > 0) {
-                        // Convert Pyth price to 1e18 precision
-                        uint256 price = _convertPythPrice(pythPrice);
+            if (source.isChainlinkSource) {
+                // Handle Chainlink price source
+                try this._getChainlinkPrice(source.oracle, source.maxAge) returns (uint256 price) {
+                    if (price > 0) {
                         prices[validPrices] = price;
                         validPrices++;
                     }
                 } catch {
-                    // Skip failed Pyth price
+                    // Skip failed Chainlink price
                     continue;
                 }
             } else {
@@ -401,11 +371,21 @@ contract FundingOracle is Ownable {
     /// @notice Get spot price from external oracles
     /// @param poolId Pool identifier
     /// @return Spot price in 1e18 precision
+    /// @dev Reverts if no price sources are configured
     function getSpotPrice(PoolId poolId) public view returns (uint256) {
         PriceSource[] storage sources = priceSources[poolId];
         if (sources.length == 0) {
-            // If no external sources, use vAMM price as fallback
-            return getMarkPrice(poolId);
+            // If no external sources, try primary Chainlink feed
+            address primaryFeed = chainlinkPriceFeeds[poolId];
+            if (primaryFeed != address(0)) {
+                try this._getChainlinkPrice(primaryFeed, chainlinkMaxStaleness) returns (uint256 price) {
+                    if (price > 0) return price;
+                } catch {
+                    // Chainlink feed failed
+                }
+            }
+            // No price sources available - revert
+            revert InsufficientPriceSources();
         }
 
         uint256[] memory prices = new uint256[](sources.length);
@@ -414,11 +394,10 @@ contract FundingOracle is Ownable {
         for (uint256 i = 0; i < sources.length; i++) {
             if (!sources[i].isActive) continue;
 
-            if (sources[i].isPythSource) {
-                // Handle Pyth price source
-                try pyth.getPriceNoOlderThan(sources[i].pythPriceFeedId, sources[i].maxAge) returns (PythStructs.Price memory pythPrice) {
-                    if (pythPrice.price > 0) {
-                        uint256 price = _convertPythPrice(pythPrice);
+            if (sources[i].isChainlinkSource) {
+                // Handle Chainlink price source
+                try this._getChainlinkPrice(sources[i].oracle, sources[i].maxAge) returns (uint256 price) {
+                    if (price > 0) {
                         prices[validPrices] = price;
                         validPrices++;
                     }
@@ -441,6 +420,62 @@ contract FundingOracle is Ownable {
         if (validPrices == 0) revert InsufficientPriceSources();
 
         return _calculateMedian(prices, validPrices);
+    }
+
+    /// @notice Get Chainlink price from aggregator
+    /// @param aggregator Address of Chainlink price feed aggregator
+    /// @param maxAge Maximum age for price data
+    /// @return price Price in 1e18 precision
+    function _getChainlinkPrice(address aggregator, uint256 maxAge) external view returns (uint256 price) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(aggregator);
+        
+        (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        ) = priceFeed.latestRoundData();
+        
+        // Silence unused variable warning
+        startedAt;
+
+        // Validate round data
+        require(answer > 0, "Invalid price");
+        require(updatedAt > 0, "Round not complete");
+        require(answeredInRound >= roundId, "Stale round");
+        
+        // Check staleness
+        if (block.timestamp - updatedAt > maxAge) {
+            revert StalePrice();
+        }
+
+        // Get decimals from the aggregator
+        uint8 decimals = priceFeed.decimals();
+        
+        // Convert to 1e18 precision
+        price = _convertChainlinkPrice(uint256(answer), decimals);
+        
+        return price;
+    }
+
+    /// @notice Convert Chainlink price to 1e18 precision
+    /// @param price Chainlink price
+    /// @param decimals Number of decimals in Chainlink price
+    /// @return price Price in 1e18 precision
+    function _convertChainlinkPrice(uint256 price, uint8 decimals) internal pure returns (uint256) {
+        // Chainlink prices typically have 8 decimals
+        // We need to convert to 1e18 precision
+        
+        if (decimals == 18) {
+            return price; // Already in correct precision
+        } else if (decimals < 18) {
+            // Scale up: multiply by 10^(18 - decimals)
+            return price * (10 ** (18 - decimals));
+        } else {
+            // Scale down: divide by 10^(decimals - 18)
+            return price / (10 ** (decimals - 18));
+        }
     }
 
     /// @notice Get premium (mark - spot) in 1e18 precision
@@ -480,64 +515,43 @@ contract FundingOracle is Ownable {
         }
     }
 
-    /// @notice Convert Pyth price to 1e18 precision
-    /// @param pythPrice Pyth price structure
-    /// @return price Price in 1e18 precision
-    function _convertPythPrice(PythStructs.Price memory pythPrice) internal pure returns (uint256) {
-        if (pythPrice.price <= 0) return 0;
-        
-        uint256 price = uint256(uint64(pythPrice.price));
-        int32 expo = pythPrice.expo;
-        
-        // Bound exponent to reasonable range to prevent overflow/underflow
-        // Real Pyth feeds typically use exponents between -12 and +12
-        if (expo > 18) expo = 18;   // Cap positive exponent
-        if (expo < -18) expo = -18; // Cap negative exponent
-        
-        // For very small prices that would round to 0, return a minimum value
-        if (expo < -12 && price < 1000) {
-            return 1; // Minimum non-zero price
-        }
-        
-        // Apply the exponent to get the actual price
-        if (expo >= 0) {
-            // Positive exponent: multiply by 10^expo
-            price = price * (10 ** uint32(expo));
-            // Scale to 1e18 precision
-            return price * PRICE_PRECISION;
-        } else {
-            // Negative exponent: scale to 1e18 first, then divide to avoid precision loss
-            uint256 divisor = 10 ** uint32(-expo);
-            uint256 result = (price * PRICE_PRECISION) / divisor;
-            
-            // Ensure we don't return 0 for valid but small prices
-            return result > 0 ? result : 1;
-        }
-    }
-
     /*//////////////////////////////////////////////////////////////
-                        PYTH UTILITY FUNCTIONS
+                        CHAINLINK UTILITY FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Get Pyth price for a specific feed ID
-    /// @param priceFeedId Pyth price feed ID
+    /// @notice Get Chainlink price for a specific aggregator
+    /// @param aggregator Address of Chainlink price feed aggregator
     /// @return price Price in 1e18 precision
-    /// @return publishTime When the price was published
-    function getPythPrice(bytes32 priceFeedId) external view returns (uint256 price, uint256 publishTime) {
-        PythStructs.Price memory pythPrice = pyth.getPriceNoOlderThan(priceFeedId, pythMaxStaleness);
-        return (_convertPythPrice(pythPrice), pythPrice.publishTime);
+    /// @return updatedAt When the price was updated
+    function getChainlinkPrice(address aggregator) external view returns (uint256 price, uint256 updatedAt) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(aggregator);
+        
+        (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt_,
+            uint80 answeredInRound
+        ) = priceFeed.latestRoundData();
+
+        require(answer > 0, "Invalid price");
+        require(updatedAt_ > 0, "Round not complete");
+        require(answeredInRound >= roundId, "Stale round");
+
+        uint8 decimals = priceFeed.decimals();
+        price = _convertChainlinkPrice(uint256(answer), decimals);
+        updatedAt = updatedAt_;
     }
 
-    /// @notice Get Pyth price for a market's primary feed
+    /// @notice Get Chainlink price for a market's primary feed
     /// @param poolId Pool identifier
     /// @return price Price in 1e18 precision
-    /// @return publishTime When the price was published
-    function getMarketPythPrice(PoolId poolId) external view returns (uint256 price, uint256 publishTime) {
-        bytes32 priceFeedId = pythPriceFeedIds[poolId];
-        if (priceFeedId == bytes32(0)) return (0, 0);
+    /// @return updatedAt When the price was updated
+    function getMarketChainlinkPrice(PoolId poolId) external view returns (uint256 price, uint256 updatedAt) {
+        address priceFeed = chainlinkPriceFeeds[poolId];
+        if (priceFeed == address(0)) return (0, 0);
         
-        PythStructs.Price memory pythPrice = pyth.getPriceNoOlderThan(priceFeedId, pythMaxStaleness);
-        return (_convertPythPrice(pythPrice), pythPrice.publishTime);
+        return this.getChainlinkPrice(priceFeed);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -614,35 +628,43 @@ contract FundingOracle is Ownable {
         emit PriceSourceUpdated(poolId, source.oracle, weight, isActive);
     }
 
-    /// @notice Set Pyth price feed ID for a market
+    /// @notice Set Chainlink price feed for a market
     /// @param poolId Pool identifier
-    /// @param priceFeedId Pyth price feed ID
-    function setPythPriceFeedId(PoolId poolId, bytes32 priceFeedId) external onlyOwner {
+    /// @param priceFeed Address of Chainlink price feed aggregator
+    function setChainlinkPriceFeed(PoolId poolId, address priceFeed) external onlyOwner {
         if (markets[poolId].lastFundingUpdate == 0) revert MarketNotFound();
         
-        pythPriceFeedIds[poolId] = priceFeedId;
-        emit PythPriceFeedAdded(poolId, priceFeedId);
+        if (priceFeed != address(0)) {
+            // Validate Chainlink feed
+            try AggregatorV3Interface(priceFeed).latestRoundData() returns (
+                uint80,
+                int256,
+                uint256,
+                uint256,
+                uint80
+            ) {
+                chainlinkPriceFeeds[poolId] = priceFeed;
+                emit ChainlinkPriceFeedAdded(poolId, priceFeed);
+            } catch {
+                revert InvalidChainlinkFeed();
+            }
+        } else {
+            chainlinkPriceFeeds[poolId] = address(0);
+        }
     }
 
-    /// @notice Set maximum staleness for Pyth prices
+    /// @notice Set maximum staleness for Chainlink prices
     /// @param maxStaleness Maximum staleness in seconds
-    function setPythMaxStaleness(uint256 maxStaleness) external onlyOwner {
+    function setChainlinkMaxStaleness(uint256 maxStaleness) external onlyOwner {
         require(maxStaleness > 0, "Invalid staleness");
-        pythMaxStaleness = maxStaleness;
+        chainlinkMaxStaleness = maxStaleness;
     }
 
-    /// @notice Withdraw accumulated fees from Pyth updates
-    /// @param to Address to send fees to
-    function withdrawFees(address payable to) external onlyOwner {
-        require(to != address(0), "Invalid address");
-        to.transfer(address(this).balance);
-    }
-
-    /// @notice Check if market has Pyth integration
+    /// @notice Check if market has Chainlink integration
     /// @param poolId Pool identifier
-    /// @return True if market has Pyth price feed ID set
-    function hasMarketPythIntegration(PoolId poolId) external view returns (bool) {
-        return pythPriceFeedIds[poolId] != bytes32(0);
+    /// @return True if market has Chainlink price feed set
+    function hasMarketChainlinkIntegration(PoolId poolId) external view returns (bool) {
+        return chainlinkPriceFeeds[poolId] != address(0);
     }
 
     /// @notice Get all price sources for a market
@@ -651,9 +673,5 @@ contract FundingOracle is Ownable {
     function getMarketPriceSources(PoolId poolId) external view returns (PriceSource[] memory) {
         return priceSources[poolId];
     }
-
-    /// @notice Receive function to accept ETH for Pyth fee payments
-    receive() external payable {
-        // Accept ETH for Pyth update fees
-    }
 }
+

@@ -18,6 +18,9 @@ contract PositionManager is Ownable, ReentrancyGuard {
     PositionNFT public immutable nft;
     MarketManager public immutable marketManager;
 
+    // Authorized contracts that can update positions (must sync with vAMM)
+    mapping(address => bool) public authorizedContracts;
+
     // Constants for backward compatibility
     uint256 public constant minMargin = 100e6;
     uint256 public constant maxLeverage = 20;
@@ -29,6 +32,8 @@ contract PositionManager is Ownable, ReentrancyGuard {
     event MarginAdded(uint256 indexed tokenId, uint256 amount);
     event MarginRemoved(uint256 indexed tokenId, uint256 amount);
     event MarketAdded(bytes32 indexed marketId, address baseAsset, address quoteAsset, address poolAddress);
+    event AuthorizedContractAdded(address indexed contractAddress);
+    event AuthorizedContractRemoved(address indexed contractAddress);
 
     constructor(
         address _factory,
@@ -38,6 +43,22 @@ contract PositionManager is Ownable, ReentrancyGuard {
         factory = PositionFactory(_factory);
         nft = PositionNFT(_nft);
         marketManager = MarketManager(_marketManager);
+    }
+
+    modifier onlyAuthorized() {
+        require(authorizedContracts[msg.sender], "Not authorized contract");
+        _;
+    }
+
+    function addAuthorizedContract(address contractAddress) external onlyOwner {
+        require(contractAddress != address(0), "Invalid address");
+        authorizedContracts[contractAddress] = true;
+        emit AuthorizedContractAdded(contractAddress);
+    }
+
+    function removeAuthorizedContract(address contractAddress) external onlyOwner {
+        authorizedContracts[contractAddress] = false;
+        emit AuthorizedContractRemoved(contractAddress);
     }
 
     /// @notice Open a new perpetual position
@@ -72,7 +93,8 @@ contract PositionManager is Ownable, ReentrancyGuard {
     }
 
     /// @notice Update position size and margin
-    function updatePosition(uint256 tokenId, int256 newSizeBase, uint256 newMargin) external returns (bool) {
+    /// @dev Only authorized contracts (PerpsHook, PerpsRouter) can call this to ensure vAMM state sync
+    function updatePosition(uint256 tokenId, int256 newSizeBase, uint256 newMargin) external onlyAuthorized returns (bool) {
         bool success = factory.updatePosition(msg.sender, tokenId, newSizeBase, newMargin);
         if (success) {
             emit PositionUpdated(tokenId, newSizeBase, newMargin);
@@ -81,7 +103,8 @@ contract PositionManager is Ownable, ReentrancyGuard {
     }
 
     /// @notice Update position size and margin on behalf of a user
-    function updatePositionFor(address user, uint256 tokenId, int256 newSizeBase, uint256 newMargin) external returns (bool) {
+    /// @dev Only authorized contracts (PerpsHook, PerpsRouter) can call this to ensure vAMM state sync
+    function updatePositionFor(address user, uint256 tokenId, int256 newSizeBase, uint256 newMargin) external onlyAuthorized returns (bool) {
         bool success = factory.updatePosition(user, tokenId, newSizeBase, newMargin);
         if (success) {
             emit PositionUpdated(tokenId, newSizeBase, newMargin);

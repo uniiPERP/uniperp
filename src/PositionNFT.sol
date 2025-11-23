@@ -22,7 +22,7 @@ contract PositionNFT is ERC721, ERC721Enumerable, Ownable {
     }
 
     function mint(address to, uint256 tokenId) external onlyFactory {
-        _safeMint(to, tokenId);
+        _mint(to, tokenId);
     }
 
     function burn(uint256 tokenId) external onlyFactory {
